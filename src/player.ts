@@ -1,0 +1,311 @@
+/**
+ * An NSF player: the game's own driver on a 6502, writing into an APU.
+ *
+ *   NSF → @xromdev/6502 runs INIT, then PLAY every frame
+ *       → each write to $4000–$4017, at the cycle it happened
+ *       → @xromdev/apu → samples
+ *
+ * Nothing here knows how any game stores its music: the driver in the file
+ * does that, exactly as it did in the cartridge. A write lands in the chip at
+ * the moment inside the frame that the CPU made it — which matters for drivers
+ * that play PCM by writing $4011 in a loop.
+ */
+
+import { Cpu6502, type Bus } from '@xromdev/6502';
+import { Apu, CPU_HZ, mixApu, OutputFilters, type ChannelBuffers, type RegisterWrite } from '@xromdev/apu';
+import { parseNsf, type NsfInfo } from './nsf.js';
+
+export interface NsfPlayerOptions {
+  sampleRate?: number;
+  /** Run the chip at this multiple of the sample rate and average down. Default 2. */
+  oversample?: number;
+  /** Master level. Default 2.2, as `@xromdev/apu`'s renderer. */
+  gain?: number;
+  /** A fader per channel, `[pulse1, pulse2, triangle, noise, dmc]`, 0..1. */
+  voiceLevels?: readonly number[];
+  /** The console's output filters. Default true. */
+  filters?: boolean;
+  /** Called for every APU write the driver makes, with its time in seconds from the song's start. */
+  onWrite?: (write: RegisterWrite) => void;
+  /**
+   * Most cycles one call of INIT or PLAY may take before it is abandoned. A
+   * well-behaved routine returns in a frame's worth (~30 000); the default
+   * allows a few seconds, for INITs that clear memory the slow way.
+   */
+  maxCallCycles?: number;
+}
+
+/** Where the fake return address of a routine call points: unmapped, never executed. */
+const SENTINEL = 0x5ff5;
+
+/** The NES's memory as an NSF sees it. */
+class NsfMachine implements Bus {
+  readonly ram = new Uint8Array(0x800);
+  readonly wram = new Uint8Array(0x2000);
+  /** $8000–$FFFF: the file's data, laid out as the header says. */
+  private readonly image: Uint8Array;
+  /** 4 KB bank per window, when the file bankswitches. */
+  private readonly banks: number[] | null;
+  private readonly bankCount: number;
+  /** Receives $4000–$4017 writes; answers $4015 reads. */
+  apuWrite: (address: number, value: number) => void = () => {};
+  apuStatus: () => number = () => 0;
+
+  constructor(private readonly info: NsfInfo) {
+    if (info.banks) {
+      // Bankswitched files are padded so the load address falls at its offset
+      // within a 4 KB bank, then cut into 4 KB banks.
+      const pad = info.loadAddress & 0x0fff;
+      this.image = new Uint8Array(Math.ceil((pad + info.data.length) / 0x1000) * 0x1000);
+      this.image.set(info.data, pad);
+      this.bankCount = this.image.length / 0x1000;
+      this.banks = [...info.banks];
+    } else {
+      this.image = new Uint8Array(0x8000);
+      const offset = info.loadAddress - 0x8000;
+      if (offset < 0) throw new Error(`load address $${info.loadAddress.toString(16)} is below $8000`);
+      this.image.set(info.data.subarray(0, 0x8000 - offset), offset);
+      this.bankCount = 0;
+      this.banks = null;
+    }
+  }
+
+  read(address: number): number {
+    if (address < 0x2000) return this.ram[address & 0x7ff];
+    if (address === 0x4015) return this.apuStatus();
+    if (address >= 0x6000 && address < 0x8000) return this.wram[address - 0x6000];
+    if (address >= 0x8000) {
+      if (!this.banks) return this.image[address - 0x8000];
+      const window = (address - 0x8000) >> 12;
+      const bank = this.banks[window] % this.bankCount;
+      return this.image[bank * 0x1000 + (address & 0x0fff)];
+    }
+    return 0;
+  }
+
+  write(address: number, value: number) {
+    if (address < 0x2000) this.ram[address & 0x7ff] = value;
+    else if (address >= 0x4000 && address <= 0x4017) this.apuWrite(address, value);
+    else if (address >= 0x5ff8 && address <= 0x5fff && this.banks) this.banks[address - 0x5ff8] = value;
+    else if (address >= 0x6000 && address < 0x8000) this.wram[address - 0x6000] = value;
+  }
+
+  resetBanks() {
+    if (this.banks && this.info.banks) this.banks.splice(0, 8, ...this.info.banks);
+  }
+}
+
+interface PendingWrite {
+  /** Chip-rate sample index. */
+  at: number;
+  address: number;
+  value: number;
+}
+
+export class NsfPlayer {
+  readonly info: NsfInfo;
+  readonly sampleRate: number;
+  /** The chip, for a caller that wants its `snapshot()`. */
+  apu: Apu;
+  private readonly machine: NsfMachine;
+  private readonly cpu: Cpu6502;
+  private readonly rate: number;
+  private readonly oversample: number;
+  private readonly options: NsfPlayerOptions;
+  private filters: OutputFilters;
+  private song = 0;
+  /** Chip-rate samples since the song started, and when the next PLAY is due. */
+  private now = 0;
+  private nextPlay = 0;
+  private readonly framePeriod: number;
+  private pending: PendingWrite[] = [];
+  private callStart = 0;
+  private callAt = 0;
+  private scratch: ChannelBuffers | null = null;
+
+  constructor(file: Uint8Array, options: NsfPlayerOptions = {}) {
+    this.info = parseNsf(file);
+    this.options = options;
+    this.sampleRate = options.sampleRate ?? 44100;
+    this.oversample = Math.max(1, Math.round(options.oversample ?? 2));
+    this.rate = this.sampleRate * this.oversample;
+    this.framePeriod = this.rate / this.info.playHz;
+    this.machine = new NsfMachine(this.info);
+    this.cpu = new Cpu6502(this.machine);
+    this.apu = this.newApu();
+    this.filters = new OutputFilters(this.rate, false);
+    this.machine.apuWrite = (address, value) => {
+      const offset = ((this.cpu.cycles - this.callStart) / CPU_HZ) * this.rate;
+      this.pending.push({ at: this.callAt + offset, address, value });
+    };
+    this.machine.apuStatus = () => {
+      const s = this.apu.snapshot();
+      return (
+        (s.pulse[0].length > 0 ? 1 : 0) |
+        (s.pulse[1].length > 0 ? 2 : 0) |
+        (s.triangle.length > 0 ? 4 : 0) |
+        (s.noise.length > 0 ? 8 : 0) |
+        (s.dmc.remaining > 0 ? 0x10 : 0)
+      );
+    };
+    this.start(this.info.startSong);
+  }
+
+  private newApu() {
+    return new Apu(this.rate, { memory: (address) => this.machine.read(address) });
+  }
+
+  /** A byte of memory as the driver sees it — RAM, the current banks, and $4015. */
+  peek(address: number): number {
+    return this.machine.read(address & 0xffff);
+  }
+
+  /** The song playing, 1-based. */
+  get currentSong() {
+    return this.song;
+  }
+
+  /** Seconds of the current song played so far. */
+  get time() {
+    return this.now / this.rate;
+  }
+
+  /** (Re)start song `song` (1-based) from the top, as the NSF spec says to. */
+  start(song: number) {
+    const n = Math.min(Math.max(1, Math.round(song)), this.info.songs);
+    this.song = n;
+    this.machine.ram.fill(0);
+    this.machine.wram.fill(0);
+    this.machine.resetBanks();
+    this.apu = this.newApu();
+    this.filters = new OutputFilters(this.rate, false);
+    this.now = 0;
+    this.pending = [];
+    // The APU as the spec leaves it for INIT: silent, all channels enabled,
+    // frame counter in 4-step mode.
+    for (let a = 0x4000; a <= 0x4013; a++) this.apu.write(a, 0);
+    this.apu.write(0x4015, 0x00);
+    this.apu.write(0x4015, 0x0f);
+    this.apu.write(0x4017, 0x40);
+    this.cpu.s = 0xfd;
+    this.call(this.info.initAddress, n - 1, this.info.region === 'PAL' ? 1 : 0, 0);
+    this.nextPlay = 0;
+  }
+
+  /** JSR `address` with A and X set, and run until it returns. */
+  private call(address: number, a: number, x: number, at: number) {
+    const cpu = this.cpu;
+    cpu.a = a & 0xff;
+    cpu.x = x & 0xff;
+    cpu.y = 0;
+    cpu.p = 0x24;
+    // Push a return address that points at the sentinel, as JSR would.
+    const back = SENTINEL - 1;
+    this.machine.write(0x100 | cpu.s, back >> 8);
+    cpu.s = (cpu.s - 1) & 0xff;
+    this.machine.write(0x100 | cpu.s, back & 0xff);
+    cpu.s = (cpu.s - 1) & 0xff;
+    cpu.pc = address;
+    this.callStart = cpu.cycles;
+    this.callAt = at;
+    const limit = this.options.maxCallCycles ?? 10_000_000;
+    while (cpu.pc !== SENTINEL && !cpu.jammed && cpu.cycles - this.callStart < limit) cpu.step();
+    if (cpu.pc !== SENTINEL) {
+      // A routine that never returns: put the stack back and move on.
+      cpu.s = 0xfd;
+    }
+  }
+
+  /**
+   * Advance `count` chip-rate samples (sample rate × oversample), writing each
+   * channel's level into `buffers` from `offset` — as `Apu.render` does, with
+   * the driver running in between. For mixing it yourself; `render` mixes.
+   */
+  renderLevels(count: number, buffers: ChannelBuffers, offset = 0) {
+    const end = this.now + count;
+    let at = offset;
+    while (this.now < end) {
+      if (this.now >= this.nextPlay) {
+        this.call(this.info.playAddress, 0, 0, this.nextPlay);
+        this.nextPlay += this.framePeriod;
+      }
+      // Apply writes that are due; the rest wait for their sample.
+      if (this.pending.length > 0) {
+        this.pending.sort((p, q) => p.at - q.at);
+        while (this.pending.length > 0 && this.pending[0].at <= this.now) {
+          const w = this.pending.shift()!;
+          this.apu.write(w.address, w.value);
+          this.options.onWrite?.({ time: w.at / this.rate, address: w.address, value: w.value });
+        }
+      }
+      const nextEvent = Math.min(
+        end,
+        Math.ceil(this.nextPlay),
+        this.pending.length > 0 ? Math.ceil(this.pending[0].at) : end
+      );
+      const run = Math.max(1, nextEvent - this.now);
+      this.apu.render(run, buffers, at);
+      at += run;
+      this.now += run;
+    }
+  }
+
+  /** Fill `out` with mixed, filtered mono samples at `sampleRate`. */
+  render(out: Float32Array) {
+    const over = this.oversample;
+    const block = 512;
+    if (!this.scratch || this.scratch.pulse1.length < block * over) {
+      const n = block * over;
+      this.scratch = {
+        pulse1: new Uint8Array(n),
+        pulse2: new Uint8Array(n),
+        triangle: new Uint8Array(n),
+        noise: new Float64Array(n),
+        dmc: new Uint8Array(n),
+      };
+    }
+    const levels = this.scratch;
+    const f = this.options.voiceLevels ?? [1, 1, 1, 1, 1];
+    const gain = this.options.gain ?? 2.2;
+    const filtered = this.options.filters !== false;
+    for (let done = 0; done < out.length; ) {
+      const n = Math.min(block, out.length - done);
+      this.renderLevels(n * over, levels);
+      for (let i = 0; i < n; i++) {
+        let sum = 0;
+        for (let k = i * over; k < (i + 1) * over; k++) {
+          const mixed = mixApu(
+            levels.pulse1[k] * (f[0] ?? 1),
+            levels.pulse2[k] * (f[1] ?? 1),
+            levels.triangle[k] * (f[2] ?? 1),
+            levels.noise[k] * (f[3] ?? 1),
+            levels.dmc[k] * (f[4] ?? 1)
+          );
+          sum += filtered ? this.filters.step(mixed) : mixed;
+        }
+        const v = (sum / over) * gain;
+        out[done + i] = v > 1 ? 1 : v < -1 ? -1 : v;
+      }
+      done += n;
+    }
+  }
+}
+
+/**
+ * Render `seconds` of song `song` from an NSF file, offline. Returns the
+ * samples and every APU write the driver made — writes that
+ * `@xromdev/apu`'s `renderWrites` plays back the same way.
+ */
+export function renderNsf(
+  file: Uint8Array,
+  song: number,
+  seconds: number,
+  options: Omit<NsfPlayerOptions, 'onWrite'> = {}
+): { samples: Float32Array; sampleRate: number; writes: RegisterWrite[]; info: NsfInfo } {
+  const writes: RegisterWrite[] = [];
+  const player = new NsfPlayer(file, { ...options, onWrite: (w) => writes.push(w) });
+  player.start(song);
+  const samples = new Float32Array(Math.round(seconds * player.sampleRate));
+  player.render(samples);
+  return { samples, sampleRate: player.sampleRate, writes, info: player.info };
+}

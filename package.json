@@ -1,0 +1,64 @@
+{
+  "name": "@xromdev/nsf",
+  "version": "0.1.0",
+  "description": "Play NES music from NSF files: the game's own driver on a 6502, writing into the APU.",
+  "license": "MIT",
+  "author": "Oleksandr Maksymov",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "keywords": [
+    "nsf",
+    "nes",
+    "famicom",
+    "chiptune",
+    "music",
+    "player",
+    "2a03",
+    "apu",
+    "6502"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/DeepNESReverse/xrom-nsf.git"
+  },
+  "homepage": "https://github.com/DeepNESReverse/xrom-nsf#readme",
+  "bugs": {
+    "url": "https://github.com/DeepNESReverse/xrom-nsf/issues"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "dependencies": {
+    "@xromdev/6502": "^0.1.0",
+    "@xromdev/apu": "^0.1.0"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "test": "vitest run",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "prepare": "npm run build",
+    "prepublishOnly": "npm run typecheck && npm test"
+  },
+  "devDependencies": {
+    "@types/node": "^22.20.4",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.7"
+  }
+}
