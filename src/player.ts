@@ -264,24 +264,29 @@ export class NsfPlayer {
         dmc: new Uint8Array(n),
       };
     }
-    const levels = this.scratch;
-    const f = this.options.voiceLevels ?? [1, 1, 1, 1, 1];
+    const { pulse1: p1, pulse2: p2, triangle: tri, noise, dmc } = this.scratch;
+    const f = this.options.voiceLevels ?? [];
+    const f0 = f[0] ?? 1;
+    const f1 = f[1] ?? 1;
+    const f2 = f[2] ?? 1;
+    const f3 = f[3] ?? 1;
+    const f4 = f[4] ?? 1;
+    // Faders at 1 multiply nothing, so the tables give exactly the formula's floats.
+    const faded = f0 !== 1 || f1 !== 1 || f2 !== 1 || f3 !== 1 || f4 !== 1;
     const gain = this.options.gain ?? 2.2;
     const filtered = this.options.filters !== false;
+    const filters = this.filters;
     for (let done = 0; done < out.length; ) {
       const n = Math.min(block, out.length - done);
-      this.renderLevels(n * over, levels);
-      for (let i = 0; i < n; i++) {
+      this.renderLevels(n * over, this.scratch);
+      for (let i = 0, k = 0; i < n; i++) {
         let sum = 0;
-        for (let k = i * over; k < (i + 1) * over; k++) {
-          const mixed = mixApu(
-            levels.pulse1[k] * (f[0] ?? 1),
-            levels.pulse2[k] * (f[1] ?? 1),
-            levels.triangle[k] * (f[2] ?? 1),
-            levels.noise[k] * (f[3] ?? 1),
-            levels.dmc[k] * (f[4] ?? 1)
-          );
-          sum += filtered ? this.filters.step(mixed) : mixed;
+        for (let j = 0; j < over; j++, k++) {
+          let mixed: number;
+          if (faded) mixed = mixApu(p1[k] * f0, p2[k] * f1, tri[k] * f2, noise[k] * f3, dmc[k] * f4);
+          else if (noise[k] === 0 && dmc[k] === 0) mixed = PULSE_MIX[p1[k] + p2[k]] + TRIANGLE_MIX[tri[k]];
+          else mixed = mixApu(p1[k], p2[k], tri[k], noise[k], dmc[k]);
+          sum += filtered ? filters.step(mixed) : mixed;
         }
         const v = (sum / over) * gain;
         out[done + i] = v > 1 ? 1 : v < -1 ? -1 : v;
@@ -290,6 +295,14 @@ export class NsfPlayer {
     }
   }
 }
+
+/**
+ * `mixApu` for whole-number levels, looked up: the two pulses summed (0..30),
+ * and the triangle alone. Built by calling `mixApu` itself, so a lookup is the
+ * very float the formula gives.
+ */
+const PULSE_MIX = Float64Array.from({ length: 31 }, (_, sum) => mixApu(sum, 0, 0, 0, 0));
+const TRIANGLE_MIX = Float64Array.from({ length: 16 }, (_, level) => mixApu(0, 0, level, 0, 0));
 
 /**
  * Render `seconds` of song `song` from an NSF file, offline. Returns the
