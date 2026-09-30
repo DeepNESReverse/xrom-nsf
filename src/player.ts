@@ -284,7 +284,7 @@ export class NsfPlayer {
         for (let j = 0; j < over; j++, k++) {
           let mixed: number;
           if (faded) mixed = mixApu(p1[k] * f0, p2[k] * f1, tri[k] * f2, noise[k] * f3, dmc[k] * f4);
-          else if (noise[k] === 0 && dmc[k] === 0) mixed = PULSE_MIX[p1[k] + p2[k]] + TRIANGLE_MIX[tri[k]];
+          else if (noise[k] === 0 && dmc[k] === 0) mixed = MIX[((p1[k] + p2[k]) << 4) | tri[k]];
           else mixed = mixApu(p1[k], p2[k], tri[k], noise[k], dmc[k]);
           sum += filtered ? filters.step(mixed) : mixed;
         }
@@ -303,6 +303,8 @@ export class NsfPlayer {
  */
 const PULSE_MIX = Float64Array.from({ length: 31 }, (_, sum) => mixApu(sum, 0, 0, 0, 0));
 const TRIANGLE_MIX = Float64Array.from({ length: 16 }, (_, level) => mixApu(0, 0, level, 0, 0));
+/** The two added up in advance, at `(pulses << 4) | triangle`: one lookup, the same floats. */
+const MIX = Float64Array.from({ length: 31 * 16 }, (_, i) => PULSE_MIX[i >> 4] + TRIANGLE_MIX[i & 15]);
 
 /**
  * Render `seconds` of song `song` from an NSF file, offline. Returns the
