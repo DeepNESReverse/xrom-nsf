@@ -1,7 +1,7 @@
 /**
  * An NSF player: the game's own driver on a 6502, writing into an APU.
  *
- *   NSF → @xromdev/6502 runs INIT, then PLAY every frame
+ *   NSF → @xromdev/cpu6502 runs INIT, then PLAY every frame
  *       → each write to $4000–$4017, at the cycle it happened
  *       → @xromdev/apu → samples
  *
@@ -11,7 +11,7 @@
  * that play PCM by writing $4011 in a loop.
  */
 
-import { Cpu6502, type Bus } from '@xromdev/6502';
+import { Cpu6502, type Bus } from '@xromdev/cpu6502';
 import { Apu, CPU_HZ, mixApu, OutputFilters, type ChannelBuffers, type RegisterWrite } from '@xromdev/apu';
 import { parseNsf, type NsfInfo } from './nsf.js';
 

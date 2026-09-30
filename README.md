@@ -1,7 +1,7 @@
 # @xromdev/nsf
 
 Play NES music from **NSF files** in TypeScript: the game's own music driver
-running on [@xromdev/6502](https://github.com/DeepNESReverse/xrom-6502), writing
+running on [@xromdev/cpu6502](https://github.com/DeepNESReverse/xrom-6502), writing
 into [@xromdev/apu](https://github.com/DeepNESReverse/xrom-apu).
 
 ```
