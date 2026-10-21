@@ -12,7 +12,7 @@
  */
 
 import { Cpu6502, type Bus } from '@xromdev/cpu6502';
-import { Apu, CPU_HZ, mixApu, OutputFilters, type ChannelBuffers, type RegisterWrite } from '@xromdev/apu';
+import { Apu, CPU_HZ, mixApu, N163Chip, OutputFilters, type ChannelBuffers, type RegisterWrite } from '@xromdev/apu';
 import { parseNsf, type NsfInfo } from './nsf.js';
 
 export interface NsfPlayerOptions {
@@ -25,7 +25,11 @@ export interface NsfPlayerOptions {
   voiceLevels?: readonly number[];
   /** The console's output filters. Default true. */
   filters?: boolean;
-  /** Called for every APU write the driver makes, with its time in seconds from the song's start. */
+  /**
+   * Called for every sound write the driver makes, with its time in seconds from the song's start —
+   * the 2A03's `$4000`–`$4017` and, on a file that uses them, the FDS's `$4040`–`$408A` and the
+   * N163's ports (`$F800` address, `$4800` data, `$E000`).
+   */
   onWrite?: (write: RegisterWrite) => void;
   /**
    * Most cycles one call of INIT or PLAY may take before it is abandoned. A
@@ -42,6 +46,19 @@ const SENTINEL = 0x5ff5;
 class NsfMachine implements Bus {
   readonly ram = new Uint8Array(0x800);
   readonly wram = new Uint8Array(0x2000);
+  /**
+   * The Disk System's memory, `$6000`–`$FFFF`, on an FDS file: the program runs from RAM, and the
+   * bank registers COPY a 4 KB bank into a window of it rather than map one in. `$6000`–`$DFFF`
+   * is writable.
+   */
+  private readonly fdsMemory: Uint8Array | null;
+  /**
+   * The N163's RAM as the CPU sees it, on an N163 file: kept here as well as in the chip so a
+   * driver reading back what it just wrote gets it at once — the chip gets the same writes at
+   * their moment in the frame.
+   */
+  readonly n163: N163Chip | null;
+  private readonly fds: boolean;
   /** $8000–$FFFF: the file's data, laid out as the header says. */
   private readonly image: Uint8Array;
   /** 4 KB bank per window, when the file bankswitches. */
@@ -52,6 +69,9 @@ class NsfMachine implements Bus {
   apuStatus: () => number = () => 0;
 
   constructor(private readonly info: NsfInfo) {
+    this.fds = info.expansion.includes('FDS');
+    this.n163 = info.expansion.includes('N163') ? new N163Chip(44100) : null;
+    this.fdsMemory = this.fds ? new Uint8Array(0xa000) : null;
     if (info.banks) {
       // Bankswitched files are padded so the load address falls at its offset
       // within a 4 KB bank, then cut into 4 KB banks.
@@ -68,11 +88,35 @@ class NsfMachine implements Bus {
       this.bankCount = 0;
       this.banks = null;
     }
+    this.loadFds();
+  }
+
+  /** The image into the Disk System's RAM: by bank when the file bankswitches, at its load address when not. */
+  private loadFds() {
+    const memory = this.fdsMemory;
+    if (!memory) return;
+    memory.fill(0);
+    if (this.banks && this.info.banks) {
+      // $6000/$7000 start with the banks the header gives $E000/$F000 — the NSF spec's rule.
+      const initial = [this.info.banks[6], this.info.banks[7], ...this.info.banks];
+      initial.forEach((bank, window) => this.copyBank(window, bank));
+    } else {
+      const offset = this.info.loadAddress - 0x6000;
+      memory.set(this.info.data.subarray(0, Math.max(0, 0xa000 - offset)), Math.max(0, offset));
+    }
+  }
+
+  /** Bank `bank` into window `window` of the Disk System's memory ($6000 + window·4 KB). */
+  private copyBank(window: number, bank: number) {
+    const start = (bank % this.bankCount) * 0x1000;
+    this.fdsMemory!.set(this.image.subarray(start, start + 0x1000), window * 0x1000);
   }
 
   read(address: number): number {
     if (address < 0x2000) return this.ram[address & 0x7ff];
     if (address === 0x4015) return this.apuStatus();
+    if (this.n163 && address >= 0x4800 && address <= 0x4fff) return this.n163.read();
+    if (this.fdsMemory && address >= 0x6000) return this.fdsMemory[address - 0x6000];
     if (address >= 0x6000 && address < 0x8000) return this.wram[address - 0x6000];
     if (address >= 0x8000) {
       if (!this.banks) return this.image[address - 0x8000];
@@ -86,12 +130,26 @@ class NsfMachine implements Bus {
   write(address: number, value: number) {
     if (address < 0x2000) this.ram[address & 0x7ff] = value;
     else if (address >= 0x4000 && address <= 0x4017) this.apuWrite(address, value);
+    else if (this.fds && address >= 0x4040 && address <= 0x408a) this.apuWrite(address, value);
+    else if (
+      this.n163 &&
+      ((address >= 0x4800 && address <= 0x4fff) || address >= 0xf800 || (address >= 0xe000 && address <= 0xe7ff))
+    ) {
+      this.n163.write(address, value);
+      this.apuWrite(address, value);
+    } else if (this.fdsMemory && address >= 0x5ff6 && address <= 0x5fff && this.banks) {
+      // Bank switching on the Disk System copies the bank in.
+      if (address >= 0x5ff8) this.banks[address - 0x5ff8] = value;
+      this.copyBank(address - 0x5ff6, value);
+    } else if (this.fdsMemory && address >= 0x6000 && address < 0xe000) this.fdsMemory[address - 0x6000] = value;
     else if (address >= 0x5ff8 && address <= 0x5fff && this.banks) this.banks[address - 0x5ff8] = value;
     else if (address >= 0x6000 && address < 0x8000) this.wram[address - 0x6000] = value;
   }
 
   resetBanks() {
     if (this.banks && this.info.banks) this.banks.splice(0, 8, ...this.info.banks);
+    this.loadFds();
+    if (this.n163) this.n163.ram.fill(0);
   }
 }
 
@@ -152,7 +210,10 @@ export class NsfPlayer {
   }
 
   private newApu() {
-    return new Apu(this.rate, { memory: (address) => this.machine.read(address) });
+    return new Apu(this.rate, {
+      memory: (address) => this.machine.read(address),
+      expansion: this.info.expansion.filter((chip) => chip === 'FDS' || chip === 'N163'),
+    });
   }
 
   /** A byte of memory as the driver sees it — RAM, the current banks, and $4015. */
@@ -262,10 +323,17 @@ export class NsfPlayer {
         triangle: new Uint8Array(n),
         noise: new Float64Array(n),
         dmc: new Uint8Array(n),
+        ...(this.apu.fds ? { fds: new Float64Array(n) } : {}),
+        ...(this.apu.n163 ? { n163: Array.from({ length: 8 }, () => new Float64Array(n)) } : {}),
       };
     }
     const { pulse1: p1, pulse2: p2, triangle: tri, noise, dmc } = this.scratch;
+    // The expansion voices, as `@xromdev/apu`'s renderer numbers them: FDS 5, N163 6.. (slot 7 first).
+    const fdsOut = this.scratch.fds;
+    const n163Out = this.scratch.n163;
     const f = this.options.voiceLevels ?? [];
+    const fFds = f[5] ?? 1;
+    const fN163 = Array.from({ length: 8 }, (_, slot) => f[6 + 7 - slot] ?? 1);
     const f0 = f[0] ?? 1;
     const f1 = f[1] ?? 1;
     const f2 = f[2] ?? 1;
@@ -286,6 +354,8 @@ export class NsfPlayer {
           if (faded) mixed = mixApu(p1[k] * f0, p2[k] * f1, tri[k] * f2, noise[k] * f3, dmc[k] * f4);
           else if (noise[k] === 0 && dmc[k] === 0) mixed = MIX[((p1[k] + p2[k]) << 4) | tri[k]];
           else mixed = mixApu(p1[k], p2[k], tri[k], noise[k], dmc[k]);
+          if (fdsOut) mixed += fdsOut[k] * fFds;
+          if (n163Out) for (let slot = 0; slot < 8; slot++) mixed += n163Out[slot]![k] * fN163[slot];
           sum += filtered ? filters.step(mixed) : mixed;
         }
         const v = (sum / over) * gain;
