@@ -1,6 +1,6 @@
 {
   "name": "@xromdev/nsf",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Play NES music from NSF files: the game's own driver on a 6502, writing into the APU.",
   "license": "MIT",
   "author": "Oleksandr Maksymov",
