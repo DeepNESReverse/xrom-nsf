@@ -127,8 +127,8 @@ describe('playing it', () => {
   it('reports every write with its time', () => {
     const { writes } = renderNsf(nsf(PULSE_DRIVER), 1, 0.1);
     expect(writes.map((w) => w.address)).toEqual([0x4000, 0x4001, 0x4002, 0x4003]);
-    // Written a few microseconds apart, in the order the code ran.
-    for (let i = 1; i < writes.length; i++) expect(writes[i].time).toBeGreaterThan(writes[i - 1].time);
+    // INIT's writes, in the order the code ran — all at time 0, as INIT is over before the first frame.
+    for (const w of writes) expect(w.time).toBe(0);
     expect(writes[3].time).toBeLessThan(0.001);
   });
 
@@ -184,5 +184,63 @@ describe('playing it', () => {
     ]);
     const player = new NsfPlayer(nsf(code), { maxCallCycles: 50_000 });
     expect(() => player.render(new Float32Array(4410))).not.toThrow();
+  });
+  it('finishes a slow INIT before the first PLAY', () => {
+    // INIT spends ~2 frames in a delay loop, then silences everything. PLAY starts a note on its
+    // first call. On the console INIT returns before PLAY ever runs, so the note must sound.
+    const code = new Map([
+      [
+        0x8000,
+        [
+          0xa2, 0x30, 0xa0, 0x00, // LDX #$30, LDY #0
+          0x88, 0xd0, 0xfd, // DEY / BNE
+          0xca, 0xd0, 0xfa, // DEX / BNE
+          0xa9, 0x00, 0x8d, 0x15, 0x40, // $4015 = 0
+          0x60,
+        ],
+      ],
+      [
+        0x8020,
+        [
+          0xa5, 0x00, 0xd0, 0x1b, 0xe6, 0x00, // once
+          0xa9, 0x01, 0x8d, 0x15, 0x40, // pulse 1 on
+          0xa9, 0xbf, 0x8d, 0x00, 0x40, // 50%, held, volume 15
+          0xa9, 0x00, 0x8d, 0x01, 0x40, // sweep off
+          0xa9, 0xfd, 0x8d, 0x02, 0x40, // period $0FD
+          0xa9, 0x00, 0x8d, 0x03, 0x40,
+          0x60,
+        ],
+      ],
+    ]);
+    const writes: number[] = [];
+    const { samples, sampleRate } = renderNsf(nsf(code), 1, 0.5);
+    const player = new NsfPlayer(nsf(code), { onWrite: (w) => w.address === 0x4015 && writes.push(w.value) });
+    player.start(1);
+    player.render(new Float32Array(4410));
+    expect(writes).toEqual([0x00, 0x01]);
+    expect(hz(samples, sampleRate, 0.3, 0.45)).toBeCloseTo(CPU_HZ / (16 * 254), 0);
+  });
+
+  it('answers $4015 with the writes of the call that reads it', () => {
+    // PLAY starts pulse 1, reads $4015 straight back and keeps it in $10; then silences it and
+    // reads again into $11.
+    const code = new Map([
+      [0x8000, [0x60]],
+      [
+        0x8020,
+        [
+          0xa9, 0x01, 0x8d, 0x15, 0x40,
+          0xa9, 0x00, 0x8d, 0x03, 0x40, // length loaded
+          0xad, 0x15, 0x40, 0x85, 0x10, // read: sounding
+          0xa9, 0x00, 0x8d, 0x15, 0x40,
+          0xad, 0x15, 0x40, 0x85, 0x11, // read: stopped
+          0x60,
+        ],
+      ],
+    ]);
+    const player = new NsfPlayer(nsf(code));
+    player.render(new Float32Array(1000));
+    expect(player.peek(0x10) & 1).toBe(1);
+    expect(player.peek(0x11) & 1).toBe(0);
   });
 });

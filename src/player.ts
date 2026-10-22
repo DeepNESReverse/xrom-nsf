@@ -177,6 +177,9 @@ export class NsfPlayer {
   private nextPlay = 0;
   private readonly framePeriod: number;
   private pending: PendingWrite[] = [];
+  /** The channels $4015 enables, as the driver last wrote it — and as it stood before the writes still pending. */
+  private enabled = 0x0f;
+  private enabledAtCall = 0x0f;
   private callStart = 0;
   private callAt = 0;
   private scratch: ChannelBuffers | null = null;
@@ -194,19 +197,35 @@ export class NsfPlayer {
     this.filters = new OutputFilters(this.rate, false);
     this.machine.apuWrite = (address, value) => {
       const offset = ((this.cpu.cycles - this.callStart) / CPU_HZ) * this.rate;
+      if (this.pending.length === 0) this.enabledAtCall = this.enabled;
+      if (address === 0x4015) this.enabled = value & 0x1f;
       this.pending.push({ at: this.callAt + offset, address, value });
     };
     this.machine.apuStatus = () => {
       const s = this.apu.snapshot();
-      return (
+      let status =
         (s.pulse[0].length > 0 ? 1 : 0) |
         (s.pulse[1].length > 0 ? 2 : 0) |
         (s.triangle.length > 0 ? 4 : 0) |
         (s.noise.length > 0 ? 8 : 0) |
-        (s.dmc.remaining > 0 ? 0x10 : 0)
-      );
+        (s.dmc.remaining > 0 ? 0x10 : 0);
+      // The chip has not had this call's writes yet — they wait for their sample — but on the
+      // console they have already happened: a driver that starts a note and then reads $4015
+      // must see it sounding, one that silences a channel must see it stop.
+      let enabled = this.enabledAtCall;
+      for (const w of this.pending) {
+        if (w.address === 0x4015) {
+          enabled = w.value & 0x1f;
+          status &= enabled | 0xe0;
+          if (w.value & 0x10) status |= 0x10;
+        } else if ((w.address & 0xfff3) === 0x4003 && w.address <= 0x400f) {
+          const bit = 1 << ((w.address - 0x4003) >> 2);
+          if (enabled & bit) status |= bit;
+        }
+      }
+      return status;
     };
-    this.start(this.info.startSong);
+    this.start(this.info.startSong, false);
   }
 
   private newApu() {
@@ -232,7 +251,7 @@ export class NsfPlayer {
   }
 
   /** (Re)start song `song` (1-based) from the top, as the NSF spec says to. */
-  start(song: number) {
+  start(song: number, report = true) {
     const n = Math.min(Math.max(1, Math.round(song)), this.info.songs);
     this.song = n;
     this.machine.ram.fill(0);
@@ -248,8 +267,17 @@ export class NsfPlayer {
     this.apu.write(0x4015, 0x00);
     this.apu.write(0x4015, 0x0f);
     this.apu.write(0x4017, 0x40);
+    this.enabled = this.enabledAtCall = 0x0f;
     this.cpu.s = 0xfd;
     this.call(this.info.initAddress, n - 1, this.info.region === 'PAL' ? 1 : 0, 0);
+    // INIT runs to its end before the first PLAY, as on the console. Timed from 0 like PLAY, a
+    // long INIT (one clearing memory the slow way) would have its last writes land after the
+    // first frame's notes — a late `$4015 = 0` silencing them. Its writes all count as time 0.
+    for (const w of this.pending) {
+      this.apu.write(w.address, w.value);
+      if (report) this.options.onWrite?.({ time: 0, address: w.address, value: w.value });
+    }
+    this.pending = [];
     this.nextPlay = 0;
   }
 
