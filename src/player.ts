@@ -115,7 +115,13 @@ class NsfMachine implements Bus {
   read(address: number): number {
     if (address < 0x2000) return this.ram[address & 0x7ff];
     if (address === 0x4015) return this.apuStatus();
-    if (this.n163 && address >= 0x4800 && address <= 0x4fff) return this.n163.read();
+    if (this.n163 && address >= 0x4800 && address <= 0x4fff) {
+      // A read steps the address on, as a write does — Namco's drivers skip the phase bytes this
+      // way. The chip only hears writes, so it is told where the port now points.
+      const v = this.n163.read();
+      this.apuWrite(0xf800, this.n163.port);
+      return v;
+    }
     if (this.fdsMemory && address >= 0x6000) return this.fdsMemory[address - 0x6000];
     if (address >= 0x6000 && address < 0x8000) return this.wram[address - 0x6000];
     if (address >= 0x8000) {

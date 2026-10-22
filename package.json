@@ -46,7 +46,7 @@
     "access": "public"
   },
   "dependencies": {
-    "@xromdev/apu": "^0.4.0",
+    "@xromdev/apu": "^0.4.2",
     "@xromdev/cpu6502": "^0.1.0"
   },
   "scripts": {

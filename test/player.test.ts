@@ -243,4 +243,27 @@ describe('playing it', () => {
     expect(player.peek(0x10) & 1).toBe(1);
     expect(player.peek(0x11) & 1).toBe(0);
   });
+  it('lets an N163 driver step over bytes by reading the data port', () => {
+    // INIT: address $78 with auto-increment, write $11, READ (skipping $79), write $22.
+    const code = new Map([
+      [
+        0x8000,
+        [
+          0xa9, 0xf8, 0x8d, 0x00, 0xf8,
+          0xa9, 0x11, 0x8d, 0x00, 0x48,
+          0xad, 0x00, 0x48,
+          0xa9, 0x22, 0x8d, 0x00, 0x48,
+          0x60,
+        ],
+      ],
+      [0x8020, [0x60]],
+    ]);
+    const file = nsf(code);
+    file[0x7b] = 0x10; // N163
+    const player = new NsfPlayer(file);
+    player.start(1);
+    player.render(new Float32Array(100));
+    const ram = player.apu.n163!.ram;
+    expect([ram[0x78], ram[0x79], ram[0x7a]]).toEqual([0x11, 0, 0x22]);
+  });
 });
