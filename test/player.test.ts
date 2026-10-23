@@ -266,4 +266,33 @@ describe('playing it', () => {
     const ram = player.apu.n163!.ram;
     expect([ram[0x78], ram[0x79], ram[0x7a]]).toEqual([0x11, 0, 0x22]);
   });
+
+  it('sends the $9000–$B002 writes of a VRC6 file to the chip, and drops them on any other file', () => {
+    // INIT: VRC6 pulse 1 at 50% duty, volume 15, period 253 (440 Hz), enabled.
+    const code = new Map([
+      [
+        0x8000,
+        [
+          0xa9, 0x7f, 0x8d, 0x00, 0x90, // LDA #$7F, STA $9000
+          0xa9, 0xfd, 0x8d, 0x01, 0x90, // LDA #$FD, STA $9001
+          0xa9, 0x80, 0x8d, 0x02, 0x90, // LDA #$80, STA $9002
+          0x60,
+        ],
+      ],
+      [0x8020, [0x60]],
+    ]);
+    const file = nsf(code);
+    file[0x7b] = 0x01; // VRC6
+    const played = renderNsf(file, 1, 0.5);
+    expect(played.writes.filter((w) => w.address >= 0x9000).map((w) => w.address)).toEqual([0x9000, 0x9001, 0x9002]);
+    expect(hz(played.samples, played.sampleRate, 0.1, 0.4)).toBeCloseTo(CPU_HZ / (16 * 254), -1);
+    const player = new NsfPlayer(file);
+    player.render(new Float32Array(100));
+    expect(player.apu.snapshot().vrc6?.pulse[0]).toMatchObject({ period: 253, volume: 15, enabled: true });
+
+    file[0x7b] = 0;
+    const plain = renderNsf(file, 1, 0.2);
+    expect(plain.writes.some((w) => w.address >= 0x9000)).toBe(false);
+    expect(plain.samples.every((v) => Math.abs(v) < 1e-3)).toBe(true);
+  });
 });

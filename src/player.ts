@@ -27,8 +27,9 @@ export interface NsfPlayerOptions {
   filters?: boolean;
   /**
    * Called for every sound write the driver makes, with its time in seconds from the song's start —
-   * the 2A03's `$4000`–`$4017` and, on a file that uses them, the FDS's `$4040`–`$408A` and the
-   * N163's ports (`$F800` address, `$4800` data, `$E000`).
+   * the 2A03's `$4000`–`$4017` and, on a file that uses them, the FDS's `$4040`–`$408A`, the
+   * N163's ports (`$F800` address, `$4800` data, `$E000`) and the VRC6's `$9000`–`$9003`,
+   * `$A000`–`$A002`, `$B000`–`$B002`.
    */
   onWrite?: (write: RegisterWrite) => void;
   /**
@@ -41,6 +42,10 @@ export interface NsfPlayerOptions {
 
 /** Where the fake return address of a routine call points: unmapped, never executed. */
 const SENTINEL = 0x5ff5;
+
+/** `$9000`–`$9003`, `$A000`–`$A002`, `$B000`–`$B002`: the VRC6's registers, where the NSF format puts them. */
+const isVrc6Address = (address: number) =>
+  (address >= 0x9000 && address <= 0x9003) || (address >= 0xa000 && address <= 0xa002) || (address >= 0xb000 && address <= 0xb002);
 
 /** The NES's memory as an NSF sees it. */
 class NsfMachine implements Bus {
@@ -59,6 +64,7 @@ class NsfMachine implements Bus {
    */
   readonly n163: N163Chip | null;
   private readonly fds: boolean;
+  private readonly vrc6: boolean;
   /** $8000–$FFFF: the file's data, laid out as the header says. */
   private readonly image: Uint8Array;
   /** 4 KB bank per window, when the file bankswitches. */
@@ -70,6 +76,7 @@ class NsfMachine implements Bus {
 
   constructor(private readonly info: NsfInfo) {
     this.fds = info.expansion.includes('FDS');
+    this.vrc6 = info.expansion.includes('VRC6');
     this.n163 = info.expansion.includes('N163') ? new N163Chip(44100) : null;
     this.fdsMemory = this.fds ? new Uint8Array(0xa000) : null;
     if (info.banks) {
@@ -137,6 +144,7 @@ class NsfMachine implements Bus {
     if (address < 0x2000) this.ram[address & 0x7ff] = value;
     else if (address >= 0x4000 && address <= 0x4017) this.apuWrite(address, value);
     else if (this.fds && address >= 0x4040 && address <= 0x408a) this.apuWrite(address, value);
+    else if (this.vrc6 && isVrc6Address(address)) this.apuWrite(address, value);
     else if (
       this.n163 &&
       ((address >= 0x4800 && address <= 0x4fff) || address >= 0xf800 || (address >= 0xe000 && address <= 0xe7ff))
@@ -237,7 +245,7 @@ export class NsfPlayer {
   private newApu() {
     return new Apu(this.rate, {
       memory: (address) => this.machine.read(address),
-      expansion: this.info.expansion.filter((chip) => chip === 'FDS' || chip === 'N163'),
+      expansion: this.info.expansion.filter((chip) => chip === 'FDS' || chip === 'N163' || chip === 'VRC6'),
     });
   }
 
@@ -359,15 +367,19 @@ export class NsfPlayer {
         dmc: new Uint8Array(n),
         ...(this.apu.fds ? { fds: new Float64Array(n) } : {}),
         ...(this.apu.n163 ? { n163: Array.from({ length: 8 }, () => new Float64Array(n)) } : {}),
+        ...(this.apu.vrc6 ? { vrc6: Array.from({ length: 3 }, () => new Float64Array(n)) } : {}),
       };
     }
     const { pulse1: p1, pulse2: p2, triangle: tri, noise, dmc } = this.scratch;
-    // The expansion voices, as `@xromdev/apu`'s renderer numbers them: FDS 5, N163 6.. (slot 7 first).
+    // The expansion voices, as `@xromdev/apu`'s renderer numbers them: FDS 5, N163 6.. (slot 7
+    // first), VRC6 14 (pulse 1), 15 (pulse 2), 16 (saw).
     const fdsOut = this.scratch.fds;
     const n163Out = this.scratch.n163;
+    const vrc6Out = this.scratch.vrc6;
     const f = this.options.voiceLevels ?? [];
     const fFds = f[5] ?? 1;
     const fN163 = Array.from({ length: 8 }, (_, slot) => f[6 + 7 - slot] ?? 1);
+    const fVrc6 = [f[14] ?? 1, f[15] ?? 1, f[16] ?? 1];
     const f0 = f[0] ?? 1;
     const f1 = f[1] ?? 1;
     const f2 = f[2] ?? 1;
@@ -390,6 +402,7 @@ export class NsfPlayer {
           else mixed = mixApu(p1[k], p2[k], tri[k], noise[k], dmc[k]);
           if (fdsOut) mixed += fdsOut[k] * fFds;
           if (n163Out) for (let slot = 0; slot < 8; slot++) mixed += n163Out[slot]![k] * fN163[slot];
+          if (vrc6Out) mixed += vrc6Out[0]![k] * fVrc6[0] + vrc6Out[1]![k] * fVrc6[1] + vrc6Out[2]![k] * fVrc6[2];
           sum += filtered ? filters.step(mixed) : mixed;
         }
         const v = (sum / over) * gain;
