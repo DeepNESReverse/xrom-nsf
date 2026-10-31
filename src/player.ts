@@ -264,9 +264,13 @@ export class NsfPlayer {
     return this.now / this.rate;
   }
 
-  /** (Re)start song `song` (1-based) from the top, as the NSF spec says to. */
+  /**
+   * (Re)start song `song` (1-based) from the top, as the NSF spec says to. A number past the
+   * header's count is played, not clamped: a rip may hold songs its header does not list, and
+   * INIT gets `song - 1` in A whatever the header says. Only A's byte bounds it, 1 to 256.
+   */
   start(song: number, report = true) {
-    const n = Math.min(Math.max(1, Math.round(song)), this.info.songs);
+    const n = Math.min(Math.max(1, Math.round(song)), 256);
     this.song = n;
     this.machine.ram.fill(0);
     this.machine.wram.fill(0);

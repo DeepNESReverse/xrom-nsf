@@ -110,6 +110,19 @@ describe('playing it', () => {
     expect(hz(two.samples, two.sampleRate, 0.1, 0.45)).toBeCloseTo(CPU_HZ / (16 * 170), 0);
   });
 
+  it('plays a song past the header count instead of clamping it', () => {
+    // The header lists two songs; the driver's table holds a third.
+    const driver = new Map(PULSE_DRIVER);
+    driver.set(0x8040, [0xfd, 0xa9, 0x7e]); // periods: 253, 169, 126 (881 Hz)
+    const file = nsf(driver, { songs: 2 });
+    const three = renderNsf(file, 3, 0.5);
+    expect(hz(three.samples, three.sampleRate, 0.1, 0.45)).toBeCloseTo(CPU_HZ / (16 * 127), 0);
+    const player = new NsfPlayer(file);
+    player.start(3);
+    expect(player.currentSong).toBe(3);
+    expect(player.peek(0x0000)).toBe(2);
+  });
+
   it('calls PLAY at the header rate', () => {
     const player = new NsfPlayer(nsf(PULSE_DRIVER));
     player.render(new Float32Array(44100)); // one second

@@ -64,6 +64,9 @@ replayed, edited, or drawn.
 | `onWrite` | — | Called with every APU write and its time. |
 | `maxCallCycles` | 10 000 000 | A routine that runs longer is abandoned rather than hanging the player. |
 
+`start(song)` passes `song - 1` to INIT even past the header's count: a rip may
+hold songs its header does not list. Only the byte in A bounds it (1 to 256).
+
 `player.apu` is the chip itself — `player.apu.snapshot()` gives its counters,
 and `player.renderLevels()` the per-channel levels for drawing oscilloscopes.
 
