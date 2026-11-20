@@ -72,13 +72,15 @@ and `player.renderLevels()` the per-channel levels for drawing oscilloscopes.
 
 ## Not supported
 
-- **Expansion audio** other than the FDS, the N163 and the VRC6: VRC7, MMC5 and
-  Sunsoft 5B. `parseNsf` lists what a file needs in `expansion`; on those only
-  its 2A03 part is played. FDS files run from the Disk System's RAM (banks
-  copied in through `$5FF6`–`$5FFF`) and play their wave channel; N163 files
-  play all their channels; VRC6 files their two pulses and the sawtooth
-  (`$9000`–`$9003`, `$A000`–`$A002`, `$B000`–`$B002`). `onWrite` reports the
-  chips' writes.
+- **Expansion audio** of the Sunsoft 5B. `parseNsf` lists what a file needs in
+  `expansion`; on a 5B file only its 2A03 part is played. The other five chips
+  play: FDS files run from the Disk System's RAM (banks copied in through
+  `$5FF6`–`$5FFF`) and play their wave channel; N163 files all their channels;
+  VRC6 files their two pulses and the sawtooth (`$9000`–`$9003`,
+  `$A000`–`$A002`, `$B000`–`$B002`); MMC5 files its two pulses and PCM
+  (`$5000`–`$5015`), with its ExRAM (`$5C00`–`$5FF5`) and multiplier
+  (`$5205`/`$5206`); VRC7 files its six FM channels (`$9010`/`$9030`).
+  `onWrite` reports the chips' writes.
 - NSF2 and NSFe extras (per-track lengths, playlists, IRQ-driven playback).
 - PAL timing of the chip itself (a PAL file's play rate is honoured).
 

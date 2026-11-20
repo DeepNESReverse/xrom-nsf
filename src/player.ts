@@ -28,8 +28,8 @@ export interface NsfPlayerOptions {
   /**
    * Called for every sound write the driver makes, with its time in seconds from the song's start —
    * the 2A03's `$4000`–`$4017` and, on a file that uses them, the FDS's `$4040`–`$408A`, the
-   * N163's ports (`$F800` address, `$4800` data, `$E000`) and the VRC6's `$9000`–`$9003`,
-   * `$A000`–`$A002`, `$B000`–`$B002`.
+   * N163's ports (`$F800` address, `$4800` data, `$E000`), the VRC6's `$9000`–`$9003`,
+   * `$A000`–`$A002`, `$B000`–`$B002`, the MMC5's `$5000`–`$5015` and the VRC7's `$9010`/`$9030`.
    */
   onWrite?: (write: RegisterWrite) => void;
   /**
@@ -65,6 +65,14 @@ class NsfMachine implements Bus {
   readonly n163: N163Chip | null;
   private readonly fds: boolean;
   private readonly vrc6: boolean;
+  private readonly vrc7: boolean;
+  /**
+   * The MMC5's own memory, on an MMC5 file: its 1 KB ExRAM at `$5C00`–`$5FF5` and the two operands
+   * of its 8×8 multiplier, `$5205`/`$5206` (read back as the product's low and high bytes).
+   */
+  private readonly exram: Uint8Array | null;
+  private multiplicand = 0xff;
+  private multiplier = 0xff;
   /** $8000–$FFFF: the file's data, laid out as the header says. */
   private readonly image: Uint8Array;
   /** 4 KB bank per window, when the file bankswitches. */
@@ -73,10 +81,14 @@ class NsfMachine implements Bus {
   /** Receives $4000–$4017 writes; answers $4015 reads. */
   apuWrite: (address: number, value: number) => void = () => {};
   apuStatus: () => number = () => 0;
+  /** Answers `$5015` reads on an MMC5 file: its pulses' length counters. */
+  mmc5Status: () => number = () => 0;
 
   constructor(private readonly info: NsfInfo) {
     this.fds = info.expansion.includes('FDS');
     this.vrc6 = info.expansion.includes('VRC6');
+    this.vrc7 = info.expansion.includes('VRC7');
+    this.exram = info.expansion.includes('MMC5') ? new Uint8Array(0x400) : null;
     this.n163 = info.expansion.includes('N163') ? new N163Chip(44100) : null;
     this.fdsMemory = this.fds ? new Uint8Array(0xa000) : null;
     if (info.banks) {
@@ -122,6 +134,12 @@ class NsfMachine implements Bus {
   read(address: number): number {
     if (address < 0x2000) return this.ram[address & 0x7ff];
     if (address === 0x4015) return this.apuStatus();
+    if (this.exram && address >= 0x5000 && address < 0x6000) {
+      if (address === 0x5015) return this.mmc5Status();
+      if (address === 0x5205) return (this.multiplicand * this.multiplier) & 0xff;
+      if (address === 0x5206) return (this.multiplicand * this.multiplier) >> 8;
+      if (address >= 0x5c00 && address <= 0x5ff5) return this.exram[address - 0x5c00];
+    }
     if (this.n163 && address >= 0x4800 && address <= 0x4fff) {
       // A read steps the address on, as a write does — Namco's drivers skip the phase bytes this
       // way. The chip only hears writes, so it is told where the port now points.
@@ -145,6 +163,11 @@ class NsfMachine implements Bus {
     else if (address >= 0x4000 && address <= 0x4017) this.apuWrite(address, value);
     else if (this.fds && address >= 0x4040 && address <= 0x408a) this.apuWrite(address, value);
     else if (this.vrc6 && isVrc6Address(address)) this.apuWrite(address, value);
+    else if (this.vrc7 && (address === 0x9010 || address === 0x9030)) this.apuWrite(address, value);
+    else if (this.exram && address >= 0x5000 && address <= 0x5015) this.apuWrite(address, value);
+    else if (this.exram && address === 0x5205) this.multiplicand = value;
+    else if (this.exram && address === 0x5206) this.multiplier = value;
+    else if (this.exram && address >= 0x5c00 && address <= 0x5ff5) this.exram[address - 0x5c00] = value;
     else if (
       this.n163 &&
       ((address >= 0x4800 && address <= 0x4fff) || address >= 0xf800 || (address >= 0xe000 && address <= 0xe7ff))
@@ -164,6 +187,8 @@ class NsfMachine implements Bus {
     if (this.banks && this.info.banks) this.banks.splice(0, 8, ...this.info.banks);
     this.loadFds();
     if (this.n163) this.n163.ram.fill(0);
+    if (this.exram) this.exram.fill(0);
+    this.multiplicand = this.multiplier = 0xff;
   }
 }
 
@@ -239,13 +264,30 @@ export class NsfPlayer {
       }
       return status;
     };
+    this.machine.mmc5Status = () => {
+      let status = this.apu.mmc5?.status() ?? 0;
+      // As for $4015: this call's writes have happened on the console, if not yet in the chip.
+      let enabled = 3;
+      for (const w of this.pending) {
+        if (w.address === 0x5015) {
+          enabled = w.value & 3;
+          status &= enabled;
+        } else if (w.address === 0x5003 || w.address === 0x5007) {
+          const bit = w.address === 0x5003 ? 1 : 2;
+          if (enabled & bit) status |= bit;
+        }
+      }
+      return status;
+    };
     this.start(this.info.startSong, false);
   }
 
   private newApu() {
     return new Apu(this.rate, {
       memory: (address) => this.machine.read(address),
-      expansion: this.info.expansion.filter((chip) => chip === 'FDS' || chip === 'N163' || chip === 'VRC6'),
+      expansion: this.info.expansion.filter(
+        (chip) => chip === 'FDS' || chip === 'N163' || chip === 'VRC6' || chip === 'MMC5' || chip === 'VRC7'
+      ),
     });
   }
 
@@ -372,11 +414,13 @@ export class NsfPlayer {
         ...(this.apu.fds ? { fds: new Float64Array(n) } : {}),
         ...(this.apu.n163 ? { n163: Array.from({ length: 8 }, () => new Float64Array(n)) } : {}),
         ...(this.apu.vrc6 ? { vrc6: Array.from({ length: 3 }, () => new Float64Array(n)) } : {}),
+        ...(this.apu.mmc5 ? { mmc5: Array.from({ length: 3 }, () => new Float64Array(n)) } : {}),
+        ...(this.apu.vrc7 ? { vrc7: Array.from({ length: 6 }, () => new Float64Array(n)) } : {}),
       };
     }
     const { pulse1: p1, pulse2: p2, triangle: tri, noise, dmc } = this.scratch;
     // The expansion voices, as `@xromdev/apu`'s renderer numbers them: FDS 5, N163 6.. (slot 7
-    // first), VRC6 14 (pulse 1), 15 (pulse 2), 16 (saw).
+    // first), VRC6 14 (pulse 1), 15 (pulse 2), 16 (saw), MMC5 17, 18 (pulses), 19 (PCM), VRC7 20..25.
     const fdsOut = this.scratch.fds;
     const n163Out = this.scratch.n163;
     const vrc6Out = this.scratch.vrc6;
@@ -384,6 +428,10 @@ export class NsfPlayer {
     const fFds = f[5] ?? 1;
     const fN163 = Array.from({ length: 8 }, (_, slot) => f[6 + 7 - slot] ?? 1);
     const fVrc6 = [f[14] ?? 1, f[15] ?? 1, f[16] ?? 1];
+    const mmc5Out = this.scratch.mmc5;
+    const fMmc5 = [f[17] ?? 1, f[18] ?? 1, f[19] ?? 1];
+    const vrc7Out = this.scratch.vrc7;
+    const fVrc7 = [20, 21, 22, 23, 24, 25].map((voice) => f[voice] ?? 1);
     const f0 = f[0] ?? 1;
     const f1 = f[1] ?? 1;
     const f2 = f[2] ?? 1;
@@ -407,6 +455,8 @@ export class NsfPlayer {
           if (fdsOut) mixed += fdsOut[k] * fFds;
           if (n163Out) for (let slot = 0; slot < 8; slot++) mixed += n163Out[slot]![k] * fN163[slot];
           if (vrc6Out) mixed += vrc6Out[0]![k] * fVrc6[0] + vrc6Out[1]![k] * fVrc6[1] + vrc6Out[2]![k] * fVrc6[2];
+          if (mmc5Out) mixed += mmc5Out[0]![k] * fMmc5[0] + mmc5Out[1]![k] * fMmc5[1] + mmc5Out[2]![k] * fMmc5[2];
+          if (vrc7Out) for (let c = 0; c < 6; c++) mixed += vrc7Out[c]![k] * fVrc7[c]!;
           sum += filtered ? filters.step(mixed) : mixed;
         }
         const v = (sum / over) * gain;

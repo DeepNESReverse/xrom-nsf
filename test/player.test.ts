@@ -308,4 +308,55 @@ describe('playing it', () => {
     expect(plain.writes.some((w) => w.address >= 0x9000)).toBe(false);
     expect(plain.samples.every((v) => Math.abs(v) < 1e-3)).toBe(true);
   });
+
+  it('gives an MMC5 file its pulses, multiplier and ExRAM, and reads $5015 back', () => {
+    // INIT: MMC5 pulse 1 at 50% duty, constant volume 15, period 253 (440 Hz); 7 × 9 through the
+    // multiplier into $00/$01; $5C00 written and read back into $02; $5015 read into $03.
+    const code = new Map([
+      [
+        0x8000,
+        [
+          0xa9, 0x01, 0x8d, 0x15, 0x50, // LDA #$01, STA $5015
+          0xa9, 0xbf, 0x8d, 0x00, 0x50, // LDA #$BF, STA $5000
+          0xa9, 0xfd, 0x8d, 0x02, 0x50, // LDA #$FD, STA $5002
+          0xa9, 0x08, 0x8d, 0x03, 0x50, // LDA #$08, STA $5003 (length on)
+          0xa9, 0x07, 0x8d, 0x05, 0x52, // LDA #7, STA $5205
+          0xa9, 0x09, 0x8d, 0x06, 0x52, // LDA #9, STA $5206
+          0xad, 0x05, 0x52, 0x85, 0x00, // LDA $5205, STA $00
+          0xad, 0x06, 0x52, 0x85, 0x01, // LDA $5206, STA $01
+          0xa9, 0x5a, 0x8d, 0x00, 0x5c, // LDA #$5A, STA $5C00
+          0xad, 0x00, 0x5c, 0x85, 0x02, // LDA $5C00, STA $02
+          0xad, 0x15, 0x50, 0x85, 0x03, // LDA $5015, STA $03
+          0x60,
+        ],
+      ],
+      [0x8100, [0x60]],
+    ]);
+    const file = nsf(code, { play: 0x8100 });
+    file[0x7b] = 0x08; // MMC5
+    const played = renderNsf(file, 1, 0.5);
+    expect(played.writes.filter((w) => w.address >= 0x5000 && w.address <= 0x5015).map((w) => w.address)).toEqual([0x5015, 0x5000, 0x5002, 0x5003]);
+    expect(hz(played.samples, played.sampleRate, 0.1, 0.4)).toBeCloseTo(CPU_HZ / (16 * 254), -1);
+    const player = new NsfPlayer(file);
+    expect([player.peek(0x00), player.peek(0x01), player.peek(0x02), player.peek(0x03)]).toEqual([63, 0, 0x5a, 1]);
+    player.render(new Float32Array(100));
+    expect(player.apu.snapshot().mmc5?.pulse[0]).toMatchObject({ period: 253, volume: 15, enabled: true });
+  });
+
+  it('sends the $9010/$9030 writes of a VRC7 file to its FM chip', () => {
+    // INIT: channel 0 on instrument 3 at volume 0, f-number 290, octave 4 (440 Hz), keyed on.
+    const reg = (r: number, v: number) => [0xa9, r, 0x8d, 0x10, 0x90, 0xa9, v, 0x8d, 0x30, 0x90];
+    const code = new Map([
+      [0x8000, [...reg(0x30, 0x30), ...reg(0x10, 290 & 0xff), ...reg(0x20, 0x10 | (4 << 1) | 1), 0x60]],
+      [0x8100, [0x60]],
+    ]);
+    const file = nsf(code, { play: 0x8100 });
+    file[0x7b] = 0x02; // VRC7
+    const played = renderNsf(file, 1, 0.5);
+    expect(played.writes.filter((w) => w.address === 0x9030).map((w) => w.value)).toEqual([0x30, 290 & 0xff, 0x19]);
+    expect(played.samples.some((v) => Math.abs(v) > 0.01)).toBe(true);
+    const player = new NsfPlayer(file);
+    player.render(new Float32Array(100));
+    expect(player.apu.snapshot().vrc7?.channels[0]).toMatchObject({ fnum: 290, block: 4, key: true, instrument: 3 });
+  });
 });
