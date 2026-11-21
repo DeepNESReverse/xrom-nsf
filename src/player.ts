@@ -102,8 +102,10 @@ class NsfMachine implements Bus {
     } else {
       this.image = new Uint8Array(0x8000);
       const offset = info.loadAddress - 0x8000;
-      if (offset < 0) throw new Error(`load address $${info.loadAddress.toString(16)} is below $8000`);
-      this.image.set(info.data.subarray(0, 0x8000 - offset), offset);
+      // The Disk System runs from its RAM at $6000 (loadFds), and a rip may load there: Pro Wres's at $6000.
+      if (offset < 0 && !this.fds) throw new Error(`load address $${info.loadAddress.toString(16)} is below $8000`);
+      if (offset < 0) this.image.set(info.data.subarray(-offset, -offset + 0x8000));
+      else this.image.set(info.data.subarray(0, 0x8000 - offset), offset);
       this.bankCount = 0;
       this.banks = null;
     }

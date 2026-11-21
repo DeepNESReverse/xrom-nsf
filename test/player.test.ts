@@ -359,4 +359,22 @@ describe('playing it', () => {
     player.render(new Float32Array(100));
     expect(player.apu.snapshot().vrc7?.channels[0]).toMatchObject({ fnum: 290, block: 4, key: true, instrument: 3 });
   });
+
+  it('runs a Disk System file that loads below $8000 from its RAM', () => {
+    // Pro Wres's rip loads at $6000: INIT at $6000 stores $42 in $00 and calls $8000, which stores $43 in $01.
+    // The helper lays bytes out from $8000, so each key is $2000 above the address the code runs at.
+    const file = nsf(
+      new Map([
+        [0x8000, [0xa9, 0x42, 0x85, 0x00, 0x20, 0x00, 0x80, 0x60]],
+        [0x8010, [0x60]],
+        [0xa000, [0xa9, 0x43, 0x85, 0x01, 0x60]],
+      ]),
+      { init: 0x6000, play: 0x6010, size: 0x4100 }
+    );
+    file[8] = 0x00; // the load address, $6000: the file's first byte is $6000's
+    file[9] = 0x60;
+    file[0x7b] = 0x04; // FDS
+    const player = new NsfPlayer(file);
+    expect([player.peek(0x00), player.peek(0x01)]).toEqual([0x42, 0x43]);
+  });
 });
